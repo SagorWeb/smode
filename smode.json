@@ -1,0 +1,15 @@
+{
+  "name": "smode",
+  "version": "1.0.0",
+  "port": 8787,
+  "targets": {
+    "linux-x64": {
+      "file": "smode-linux-x64",
+      "sha256": "5ec4125a2d233f7405a32773eefec14cb49d054a81983a20f475dfedafc1d69d"
+    },
+    "linux-arm64": {
+      "file": "smode-linux-arm64",
+      "sha256": "a475688b0bc28454abbc85af46865abba22e9052479ce6ebb77367a7347199ff"
+    }
+  }
+}
