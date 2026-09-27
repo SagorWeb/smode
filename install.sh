@@ -39,6 +39,7 @@ if [ -f "${PREFIX:-/opt/smode}/smode.pid" ]; then
     kill "$old" 2>/dev/null || true
   fi
 fi
+sleep 1
 
 if command -v ss >/dev/null 2>&1; then
   if ss -lnt | grep -E -q ":${PORT}([^0-9]|$)"; then
@@ -87,21 +88,55 @@ fi
 mkdir -p "$PREFIX" "$DATA"
 install -m 0755 "$tmp/$asset" "$PREFIX/smode"
 
-addr="$HOST"
-if [ "$HOST" = "0.0.0.0" ] || [ "$HOST" = "::" ]; then
-  addr=$(hostname -I 2>/dev/null | awk '{ print $1 }')
-  if [ -z "$addr" ]; then
-    addr="127.0.0.1"
-  fi
+VAST_BIND_PORT=""
+VAST_PUBLIC_PORT=""
+if [ -n "${PUBLIC_IPADDR:-}" ] && [ -f /etc/portal.yaml ]; then
+  for item in $(env); do
+    case "$item" in
+      VAST_TCP_PORT_*)
+        key=${item%%=*}
+        val=${item#*=}
+        port=${key#VAST_TCP_PORT_}
+        case "$port" in
+          ''|*[!0-9]*) continue ;;
+        esac
+        if [ "$port" -gt 65535 ]; then
+          continue
+        fi
+        case "$port" in
+          22|1111|8080|8384|6006) continue ;;
+        esac
+        if grep -q "external_port: ${port}" /etc/portal.yaml; then
+          continue
+        fi
+        VAST_BIND_PORT=$port
+        VAST_PUBLIC_PORT=$val
+        break
+        ;;
+    esac
+  done
 fi
-public="http://${addr}:${PORT}"
+
+if [ -n "$VAST_BIND_PORT" ]; then
+  HOST="127.0.0.1"
+  public="http://${PUBLIC_IPADDR}:${VAST_PUBLIC_PORT}"
+else
+  addr="$HOST"
+  if [ "$HOST" = "0.0.0.0" ] || [ "$HOST" = "::" ]; then
+    addr=$(hostname -I 2>/dev/null | awk '{ print $1 }')
+    if [ -z "$addr" ]; then
+      addr="127.0.0.1"
+    fi
+  fi
+  public="http://${addr}:${PORT}"
+fi
 
 cat > "$PREFIX/smode.env" << EOF
-HOST=${HOST}
-PORT=${PORT}
-LAB_ROOT=${PREFIX}
-DATA_DIR=${DATA}
-PUBLIC_URL=${public}/admin/
+export HOST=${HOST}
+export PORT=${PORT}
+export LAB_ROOT=${PREFIX}
+export DATA_DIR=${DATA}
+export PUBLIC_URL=${public}/admin/
 EOF
 chmod 0644 "$PREFIX/smode.env"
 
@@ -133,7 +168,7 @@ EOF
 elif [ "$(id -u)" -eq 0 ] && command -v supervisorctl >/dev/null 2>&1 && [ -d /etc/supervisor/conf.d ]; then
   cat > /etc/supervisor/conf.d/smode.conf << EOF
 [program:smode]
-command=/bin/sh -c '. ${PREFIX}/smode.env && exec ${PREFIX}/smode'
+command=/bin/sh -c 'set -a; . ${PREFIX}/smode.env; set +a; exec ${PREFIX}/smode'
 directory=${PREFIX}
 autostart=true
 autorestart=true
@@ -167,18 +202,77 @@ if [ "$started" -ne 1 ]; then
   exit 1
 fi
 
-key="$DATA/registry/bootstrap-access-key.txt"
+if [ -n "$VAST_BIND_PORT" ]; then
+  python3 - "$VAST_BIND_PORT" "$PORT" << 'PY'
+import sys
+from pathlib import Path
+import yaml
+external = int(sys.argv[1])
+internal = int(sys.argv[2])
+path = Path("/etc/portal.yaml")
+data = yaml.safe_load(path.read_text()) or {"applications": {}}
+apps = data.setdefault("applications", {})
+apps["smode"] = {
+    "hostname": "127.0.0.1",
+    "external_port": external,
+    "internal_port": internal,
+    "open_path": "/",
+    "name": "smode",
+}
+path.write_text(yaml.safe_dump(data, sort_keys=False))
+PY
+  envfile="${WORKSPACE:-/workspace}/.env"
+  mkdir -p "$(dirname "$envfile")"
+  touch "$envfile"
+  if grep -q '^AUTH_EXCLUDE=' "$envfile"; then
+    current=$(sed -n 's/^AUTH_EXCLUDE=//p' "$envfile" | head -n 1)
+    case ",${current}," in
+      *",${VAST_BIND_PORT},"*) ;;
+      *)
+        sed -i "s/^AUTH_EXCLUDE=.*/AUTH_EXCLUDE=${current},${VAST_BIND_PORT}/" "$envfile"
+        ;;
+    esac
+  else
+    printf 'AUTH_EXCLUDE=%s\n' "$VAST_BIND_PORT" >> "$envfile"
+  fi
+  if command -v supervisorctl >/dev/null 2>&1; then
+    supervisorctl restart caddy >/dev/null
+  fi
+fi
+
+ready=0
 i=0
-while [ "$i" -lt 30 ] && [ ! -f "$key" ]; do
+while [ "$i" -lt 30 ]; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/docs/" || true)
+  if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+    ready=1
+    break
+  fi
   i=$((i + 1))
   sleep 1
 done
+if [ "$ready" -ne 1 ]; then
+  echo "smode did not answer on port ${PORT}." >&2
+  if [ -f /var/log/smode.log ]; then
+    tail -n 40 /var/log/smode.log >&2 || true
+  elif [ -f "$PREFIX/smode.log" ]; then
+    tail -n 40 "$PREFIX/smode.log" >&2 || true
+  fi
+  exit 1
+fi
+
+key="$DATA/registry/bootstrap-access-key.txt"
+i=0
+while [ "$i" -lt 20 ] && [ ! -f "$key" ]; do
+  i=$((i + 1))
+  sleep 1
+done
+if [ ! -f "$key" ]; then
+  echo "smode is running, but the access key was not written at ${key}." >&2
+  exit 1
+fi
 
 echo "smode"
 echo "${public}/"
 echo "${public}/docs/"
-if [ -f "$key" ]; then
-  echo "$key"
-else
-  echo "The access key file was not written yet. See ${DATA}/registry after the process finishes starting."
-fi
+echo "$key"
